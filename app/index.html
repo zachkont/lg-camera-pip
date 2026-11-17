@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Camera PiP</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+/* Overlay window: whatever is playing underneath shows through. */
+html,body{width:1920px;height:1080px;background:transparent;overflow:hidden;font-family:sans-serif;color:#fff;cursor:default}
+#pip{position:absolute;background:#000;border-radius:18px;overflow:hidden;opacity:0;
+  box-shadow:0 0 0 2px rgba(255,255,255,.18),0 18px 50px rgba(0,0,0,.6);
+  -webkit-transition:opacity .15s ease-out;transition:opacity .15s ease-out}
+#pip.on{opacity:1}
+#pip.full{border-radius:0;box-shadow:none}
+#cam{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+#bar{position:absolute;left:0;right:0;top:0;height:56px;padding:0 20px;display:-webkit-flex;display:flex;
+  -webkit-align-items:center;align-items:center;font-size:24px;
+  background:-webkit-linear-gradient(top,rgba(0,0,0,.65),rgba(0,0,0,0));background:linear-gradient(to bottom,rgba(0,0,0,.65),rgba(0,0,0,0))}
+#dot{width:12px;height:12px;border-radius:50%;background:#777;margin-right:12px;-webkit-flex:0 0 auto;flex:0 0 auto}
+.live #dot{background:#ff3b30}
+#name{-webkit-flex:1 1 auto;flex:1 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 3px rgba(0,0,0,.8)}
+#clock{-webkit-flex:0 0 auto;flex:0 0 auto;font-variant-numeric:tabular-nums;text-shadow:0 1px 3px rgba(0,0,0,.8)}
+#msg{position:absolute;left:0;right:0;top:50%;margin-top:-18px;padding:0 16px;text-align:center;font-size:28px;color:#bbb}
+.live #msg{display:none}
+#hint{position:absolute;left:0;right:0;bottom:0;padding:14px 20px;font-size:19px;color:#ddd;text-align:center;
+  background:-webkit-linear-gradient(bottom,rgba(0,0,0,.7),rgba(0,0,0,0));background:linear-gradient(to top,rgba(0,0,0,.7),rgba(0,0,0,0));
+  opacity:1;-webkit-transition:opacity .4s;transition:opacity .4s}
+#hint.gone{opacity:0}
+.s #bar{height:44px;font-size:19px;padding:0 14px}
+.s #hint{display:none}
+.s #msg{font-size:22px}
+</style>
+</head>
+<body>
+<div id="pip">
+  <img id="cam" alt="">
+  <div id="msg">Connecting…</div>
+  <div id="bar"><div id="dot"></div><div id="name"></div><div id="clock"></div></div>
+  <div id="hint">OK size · ◀ ▲ ▼ ▶ move · CH ± camera · Back close</div>
+</div>
+<canvas id="probe" width="16" height="9" style="display:none"></canvas>
+<script src="config.js"></script>
+<script>
+/*
+ * Camera PiP: a small live camera window over whatever the TV is showing.
+ *
+ * The feed is MJPEG from go2rtc, shown in a plain <img>. That is deliberate:
+ * a <video> element would ask webOS for a hardware decoder, and the one the
+ * programme underneath is using is not ours to take. JPEG frames are drawn by
+ * the browser like any other image, so the picture behind keeps playing.
+ *
+ * An <img> fires no error when a multipart stream dies mid-way: it just goes
+ * blank (or keeps the last frame). A watchdog samples the picture into a tiny
+ * canvas every couple of seconds and reconnects when it is blank or has not
+ * changed for a while. On the TV, apps run from file:// and webOS does not
+ * apply CORS to them, so the pixels are readable as they are. In a desktop
+ * browser they are only readable if go2rtc sends CORS headers (api.origin
+ * "*"); without them the image falls back to loading without crossOrigin and
+ * only a blank (dropped) picture is caught, not a frozen one.
+ *
+ * Remote: OK cycles the size, the arrows move it to another corner, CH +/-
+ * switches camera, Back closes. Opening the app again while it is up (the
+ * same remote button pressed twice) also closes it.
+ *
+ * Launch params (all optional), e.g. from Home Assistant or luna-send:
+ *   {"camera": "g6_mjpeg" | 0, "size": "s|m|l|full", "corner": "tl|tr|bl|br",
+ *    "timeout": 30}
+ * timeout = seconds until it closes on its own (0 = stays until Back).
+ *
+ * Strict ES5, so it also runs on older webOS browsers.
+ */
+(function () {
+  var DEFAULTS = { server: '', cameras: [], size: 'm', corner: 'br', timeout: 0 };
+  var CONFIG = {};
+  var user = window.CAMPIP_CONFIG || {};
+  for (var dk in DEFAULTS) if (DEFAULTS.hasOwnProperty(dk)) CONFIG[dk] = user.hasOwnProperty(dk) ? user[dk] : DEFAULTS[dk];
+  // For testing in a desktop browser: index.html?server=http://localhost:1984
+  var qs = /[?&]server=([^&]+)/.exec(window.location.search);
+  if (qs) CONFIG.server = decodeURIComponent(qs[1]);
+  CONFIG.server = String(CONFIG.server || '').replace(/\/+$/, '');
+
+  var SIZES = {                      // 16:9 boxes on the 1920x1080 window
+    s: { w: 480, h: 270 },
+    m: { w: 640, h: 360 },
+    l: { w: 960, h: 540 },
+    full: { w: 1920, h: 1080 }
+  };
+  var SIZE_ORDER = ['s', 'm', 'l', 'full'];
+  var MARGIN = 48;
+  var KEY = { left: 37, up: 38, right: 39, down: 40, ok: 13, back: 461, backspace: 8, esc: 27,
+              chUp: 33, chDown: 34 };
+  var STORE = 'campip.layout';
+  var WATCH_MS = 2000;               // how often the picture is sampled
+  var FIRST_FRAME_MS = 15000;        // no first frame by then: reconnect
+  var FROZEN_CHECKS = 5;             // unchanged samples in a row (10 s) = frozen
+
+  var pip = document.getElementById('pip');
+  var cam = document.getElementById('cam');
+  var msg = document.getElementById('msg');
+  var nameEl = document.getElementById('name');
+  var clockEl = document.getElementById('clock');
+  var hint = document.getElementById('hint');
+  var probe = document.getElementById('probe').getContext('2d');
+
+  var state = { cam: 0, size: SIZES[CONFIG.size] ? CONFIG.size : 'm',
+                corner: /^[tb][lr]$/.test(CONFIG.corner) ? CONFIG.corner : 'br' };
+  var timers = { retry: null, close: null, closeWindow: null, clock: null, hint: null, watch: null };
+  var retryMs = 1000, closing = false, live = false, cors = true, noCorsWorks = false;
+  var connectedAt = 0, lastSig = null, sameCount = 0;
+
+  if (CONFIG.cameras.length < 2) hint.textContent = 'OK size · ◀ ▲ ▼ ▶ move · Back close';
+
+  try {
+    var kept = JSON.parse(window.localStorage.getItem(STORE) || 'null');
+    if (kept) {
+      if (SIZES[kept.size]) state.size = kept.size;
+      if (/^[tb][lr]$/.test(kept.corner)) state.corner = kept.corner;
+      if (kept.cam >= 0 && kept.cam < CONFIG.cameras.length) state.cam = kept.cam;
+    }
+  } catch (e) {}
+
+  function save() {
+    try { window.localStorage.setItem(STORE, JSON.stringify(state)); } catch (e) {}
+  }
+
+  function params() {
+    try { return JSON.parse((window.PalmSystem && window.PalmSystem.launchParams) || '{}') || {}; }
+    catch (e) { return {}; }
+  }
+
+  function isEmpty(o) {
+    for (var k in o) if (o.hasOwnProperty(k)) return false;
+    return true;
+  }
+
+  function applyParams(p) {
+    if (p.camera != null) {
+      if (typeof p.camera === 'number' && CONFIG.cameras[p.camera]) state.cam = p.camera;
+      for (var i = 0; i < CONFIG.cameras.length; i++) {
+        if (CONFIG.cameras[i].src === p.camera || CONFIG.cameras[i].name === p.camera) state.cam = i;
+      }
+    }
+    if (SIZES[p.size]) state.size = p.size;
+    if (/^[tb][lr]$/.test(p.corner || '')) state.corner = p.corner;
+    return typeof p.timeout === 'number' ? p.timeout : CONFIG.timeout;
+  }
+
+  function layout() {
+    var sz = SIZES[state.size];
+    var full = state.size === 'full';
+    var x = full ? 0 : (state.corner.charAt(1) === 'l' ? MARGIN : 1920 - MARGIN - sz.w);
+    var y = full ? 0 : (state.corner.charAt(0) === 't' ? MARGIN : 1080 - MARGIN - sz.h);
+    pip.style.left = x + 'px';
+    pip.style.top = y + 'px';
+    pip.style.width = sz.w + 'px';
+    pip.style.height = sz.h + 'px';
+    var cls = ['on'];
+    if (full) cls.push('full');
+    if (state.size === 's') cls.push('s');
+    if (live) cls.push('live');
+    pip.className = cls.join(' ');
+  }
+
+  function setLive(on, text) {
+    live = on;
+    if (text) msg.textContent = text;
+    if (!closing) layout();
+  }
+
+  function connect(text) {
+    clearTimeout(timers.retry);
+    var c = CONFIG.cameras[state.cam];
+    if (!CONFIG.server || !c) {
+      setLive(false, 'Not configured: copy config.example.js to config.js');
+      return;
+    }
+    nameEl.textContent = c.name;
+    setLive(false, text || 'Connecting…');
+    lastSig = null;
+    sameCount = 0;
+    connectedAt = Date.now();
+    if (cors) cam.crossOrigin = 'anonymous';
+    else cam.removeAttribute('crossorigin');
+    // Cache-buster so a retry opens a fresh connection rather than a dead one.
+    cam.src = CONFIG.server + '/api/stream.mjpeg?src=' + encodeURIComponent(c.src) + '&_=' + Date.now();
+  }
+
+  function retry(text) {
+    if (closing) return;
+    setLive(false, text);
+    cam.removeAttribute('src');
+    clearTimeout(timers.retry);
+    timers.retry = setTimeout(function () { connect(text); }, retryMs);
+    retryMs = Math.min(retryMs * 2, 10000);
+  }
+
+  cam.onload = function () {
+    // Fires on the first frame of the multipart stream only.
+    if (closing) return;
+    retryMs = 1000;
+    if (!cors) noCorsWorks = true;
+    setLive(true);
+  };
+  cam.onerror = function () {
+    if (closing || !cam.getAttribute('src')) return;
+    // A server without CORS headers fails a crossOrigin load outright before
+    // the first frame. Try once without crossOrigin; if that loads, carry on
+    // without pixel checks rather than show nothing. If it fails too, the
+    // server is simply down: go back to CORS for the next attempt.
+    if (!live && cors && !noCorsWorks) {
+      cors = false;
+      return connect();
+    }
+    if (!live && !cors && !noCorsWorks) cors = true;
+    retry('No signal — retrying…');
+  };
+
+  // The stream died (blank picture), froze (same picture for too long), or
+  // never started: reconnect.
+  function watch() {
+    if (closing || !cam.getAttribute('src')) return;
+    if (!live) {
+      if (Date.now() - connectedAt > FIRST_FRAME_MS) retry('No signal — retrying…');
+      return;
+    }
+    try {
+      probe.drawImage(cam, 0, 0, 16, 9);
+    } catch (e) {
+      return retry('Connection lost — reconnecting…');   // a dead stream leaves a broken image
+    }
+    if (!cors) return;
+    var sig;
+    try {
+      var d = probe.getImageData(0, 0, 16, 9).data, h = 0;
+      for (var i = 0; i < d.length; i += 4) h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
+      sig = h;
+    } catch (e) {
+      return;                       // tainted after all: no freeze check
+    }
+    sameCount = sig === lastSig ? sameCount + 1 : 0;
+    lastSig = sig;
+    if (sameCount >= FROZEN_CHECKS) retry('Picture froze — reconnecting…');
+  }
+
+  function tick() {
+    var d = new Date();
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    clockEl.textContent = two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+
+  function showHint() {
+    hint.className = '';
+    clearTimeout(timers.hint);
+    timers.hint = setTimeout(function () { hint.className = 'gone'; }, 4000);
+  }
+
+  function armTimeout(sec) {
+    clearTimeout(timers.close);
+    if (sec > 0) timers.close = setTimeout(close, sec * 1000);
+  }
+
+  function open(p) {
+    // Reopened while closing: cancel the pending window.close().
+    clearTimeout(timers.closeWindow);
+    closing = false;
+    live = false;
+    retryMs = 1000;
+    var timeout = applyParams(p || {});
+    layout();
+    connect();
+    tick();
+    clearInterval(timers.clock);
+    timers.clock = setInterval(tick, 1000);
+    clearInterval(timers.watch);
+    timers.watch = setInterval(watch, WATCH_MS);
+    showHint();
+    armTimeout(timeout);
+  }
+
+  function close() {
+    if (closing) return;
+    closing = true;
+    clearTimeout(timers.retry);
+    clearTimeout(timers.close);
+    clearInterval(timers.clock);
+    clearInterval(timers.watch);
+    // Drop the MJPEG connection at once so go2rtc can stop transcoding.
+    cam.removeAttribute('src');
+    live = false;
+    pip.className = '';
+    timers.closeWindow = setTimeout(function () { window.close(); }, 160);
+  }
+
+  function cycleSize(step) {
+    var i = SIZE_ORDER.indexOf(state.size);
+    state.size = SIZE_ORDER[(i + step + SIZE_ORDER.length) % SIZE_ORDER.length];
+    layout();
+    save();
+  }
+
+  function move(vert, horiz) {
+    if (state.size === 'full') state.size = 'l';
+    state.corner = (vert || state.corner.charAt(0)) + (horiz || state.corner.charAt(1));
+    layout();
+    save();
+  }
+
+  function switchCam(step) {
+    if (CONFIG.cameras.length < 2) return;
+    state.cam = (state.cam + step + CONFIG.cameras.length) % CONFIG.cameras.length;
+    save();
+    retryMs = 1000;
+    connect();
+  }
+
+  document.addEventListener('keydown', function (e) {
+    var k = e.keyCode;
+    var closeKey = k === KEY.back || k === KEY.backspace || k === KEY.esc;
+    if (closing) return;
+    if (k === KEY.ok) cycleSize(1);
+    else if (k === KEY.left) move(null, 'l');
+    else if (k === KEY.right) move(null, 'r');
+    else if (k === KEY.up) move('t', null);
+    else if (k === KEY.down) move('b', null);
+    else if (k === KEY.chUp) switchCam(1);
+    else if (k === KEY.chDown) switchCam(-1);
+    else if (closeKey) close();
+    else return;
+    e.preventDefault();
+    if (!closeKey) {
+      // Any key while a timed popup is up keeps it open until Back.
+      clearTimeout(timers.close);
+      showHint();
+    }
+  }, true);
+
+  // Magic Remote pointer: clicking the window cycles its size.
+  pip.addEventListener('click', function () { cycleSize(1); clearTimeout(timers.close); });
+
+  // Launched again while open: the same button pressed twice closes it. A
+  // relaunch carrying params (Home Assistant popping it up) re-applies them.
+  document.addEventListener('webOSRelaunch', function () {
+    var p = params();
+    if (closing || !isEmpty(p)) open(p);
+    else close();
+  });
+
+  open(params());
+})();
+</script>
+</body>
+</html>

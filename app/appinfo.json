@@ -1,0 +1,16 @@
+{
+  "id": "com.homelab.campip",
+  "version": "1.1.0",
+  "vendor": "homelab",
+  "type": "web",
+  "main": "index.html",
+  "title": "Camera PiP",
+  "icon": "assets/icon80.png",
+  "largeIcon": "assets/icon130.png",
+  "resolution": "1920x1080",
+  "defaultWindowType": "overlay",
+  "transparent": true,
+  "disableBackHistoryAPI": true,
+  "noSplashOnLaunch": true,
+  "spinnerOnLaunch": false
+}

@@ -1,0 +1,8 @@
+# Local config: contains your LAN addresses
+app/config.js
+
+# Build output
+dist/
+
+__pycache__/
+*.pyc
